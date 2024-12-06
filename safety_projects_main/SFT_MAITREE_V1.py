@@ -1,17 +1,27 @@
 import cv2
 import threading
-from ultralytics import YOLO
-import serial
 import time
+import os
+import logging
+from ultralytics import YOLO
+from pymodbus.client import ModbusTcpClient
 
+# Setup logging configuration
+logging.basicConfig(filename='program_log.log', 
+                    level=logging.INFO, 
+                    format='%(asctime)s - %(levelname)s - %(message)s')
+                    
 class CameraCapture:
     def __init__(self, video_path):
         self.cap = cv2.VideoCapture(video_path)
         if not self.cap.isOpened():
+            # logging.error("Error: Could not open video file.")
             raise Exception("Error: Could not open video file.")
         self.frame = None
         self.running = True
-    
+        self.frame_rate = self.cap.get(cv2.CAP_PROP_FPS)
+        self.frame_delay = 1 / self.frame_rate
+
     def get_frame(self):
         return self.frame
     
@@ -20,11 +30,16 @@ class CameraCapture:
     
     def capture_frames(self):
         while self.running:
+            start_time = time.time()
             ret, frame = self.cap.read()
             if not ret:
                 self.running = False
+                logging.info("End of video file reached.")
                 break
             self.set_frame(frame)
+            elapsed_time = time.time() - start_time
+            if elapsed_time < self.frame_delay:
+                time.sleep(self.frame_delay - elapsed_time)
     
     def release(self):
         self.cap.release()
@@ -36,7 +51,7 @@ class ObjectDetector:
         self.class_list = self.model.model.names
     
     def predict(self, frame):
-        return self.model.predict(frame)
+        return self.model.predict(frame, task='detect',imgsz=640, conf=0.75)
     
     def draw_box(self, img, result):
         xyxy = result.boxes.xyxy.numpy()
@@ -74,7 +89,6 @@ def resize_image(img, scale_percent):
 def calculate_custom_areas(img):
     height, width = img.shape[:2]
     
-    # Define the areas
     area1_width = int(width * 0.4)
     area1_height = int(height * 0.4)
     area1_x1 = width // 4
@@ -88,21 +102,73 @@ def calculate_custom_areas(img):
     area2_y1 = height // 2
     area2_x2 = area2_x1 + area2_width
     area2_y2 = area2_y1 + area2_height
-    
-    return (area1_x1+300, area1_y1+200, area1_x2-300, area1_y2+120), (area2_x1+120, area2_y1-70, area2_x2-485, area2_y2-150)
+            # CPB-75D Area                                            # SULPHURIC Area
+    return (area1_x1+300, area1_y1+200, area1_x2-305, area1_y2+70), (area2_x1+120, area2_y1-70, area2_x2-485, area2_y2-205)
+
+def calculate_intersection_area(box, custom_area):
+    # Unpack box and custom area coordinates
+    x1, y1, x2, y2 = box
+    ca_x1, ca_y1, ca_x2, ca_y2 = custom_area
+
+    # Calculate intersection coordinates
+    inter_x1 = max(x1, ca_x1)
+    inter_y1 = max(y1, ca_y1)
+    inter_x2 = min(x2, ca_x2)
+    inter_y2 = min(y2, ca_y2)
+
+    # Calculate intersection area
+    inter_width = max(0, inter_x2 - inter_x1)
+    inter_height = max(0, inter_y2 - inter_y1)
+    inter_area = inter_width * inter_height
+
+    # Calculate bounding box area
+    box_area = (x2 - x1) * (y2 - y1)
+
+    # Calculate percentage of intersection
+    if box_area > 0:
+        intersection_percentage = (inter_area / box_area) * 100
+    else:
+        intersection_percentage = 0
+
+    return intersection_percentage
 
 def is_in_custom_area(box, custom_area):
     x1, y1, x2, y2 = box
     ca_x1, ca_y1, ca_x2, ca_y2 = custom_area
     return not (x2 < ca_x1 or x1 > ca_x2 or y2 < ca_y1 or y1 > ca_y2)
 
-def alert_message(message):
-    print(message)
+def alert_message(display_img, message):
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    font_scale = 0.5
+    font_thickness = 1
+    text_y = 50
+
+    text_x = display_img.shape[1] - 50  # Position text 50 pixels from the right edge
+
+    if message == 'ALARM':
+        text = "Misposition - Red Lamp"
+        text_color = (0, 0, 255)
+        alert_triggered = 'ALARM'
+        
+    elif message == 'GOOD':
+        text = "Match position - Green Lamp"
+        text_color = (0, 255, 0)
+        alert_triggered = 'GOOD'
+        
+    else:
+        return display_img, None  # No message to display
     
-# Function to save the image
+    text_size = cv2.getTextSize(text, font, font_scale, font_thickness)[0]
+    text_x -= text_size[0]  # Adjust x position to ensure text is within image bounds
+    
+    cv2.putText(display_img, text, (text_x, text_y), font, font_scale, text_color, font_thickness, cv2.LINE_AA)
+    
+    return display_img, alert_triggered
+
+    
 def save_image(frame, filename):
     cv2.imwrite(filename, frame)
-    print(f"Image saved as {filename}")
+    # logging.info(f"Image saved as {filename}")
     
 def draw_custom_area_CPB(img, custom_area):
     ca_x1, ca_y1, ca_x2, ca_y2 = custom_area
@@ -118,159 +184,147 @@ def draw_custom_area_SULP(img, custom_area):
     cv2.rectangle(img, (ca_x1, ca_y1), (ca_x2, ca_y2), color, thickness)
     return img
 
-# Paths
-video_path = r"C:\Users\Chanatip.S\Web\RecordFiles\2024-08-15\192.168.1.11_01_20240815162937973.mp4"
-model_path = r"D:\Users\Chanatip.S\Documents\WORK\safety projects\safety_projects_main\model_version_1\weights\model_version_1.pt"
+def read_coil_status(last_sent_status):
+    while True:
+        coil_status_result = client.read_coils(0, 1)
+        if coil_status_result.bits[0]:  # If coil is True
+            if last_sent_status == '0':
+                try:
+                    client.write_coil(16, False)  # Send signal 0 (reset)
+                    print("Signal 0 sent (coil reset)")
+                    last_sent_status = '0'  # Reset last sent status to '0'
+                except:
+                    print('Write 0 fail')
+            else:
+                print('Please wait for reset')  # Already in a reset state
+            break
+        time.sleep(1)  # Avoid busy-waiting by adding a delay
 
-# Initialize objects
-camera = CameraCapture(video_path)
-detector = ObjectDetector(model_path)
-scale_show = 100
-
-# Initialize serial communication
-# serial_port = 'COM3'  # Replace with your ESP32 serial port
-# baud_rate = 115200
-# ser = serial.Serial(serial_port, baud_rate, timeout=1)
-
-# Dictionary to keep track of alert conditions and their start times
-alert_times = {}
+def check_last_sent_status(last_status):
+    # Here we return the last status, this can be extended with more logic if needed
+    return last_status
 
 def process_frames():
-    fps = camera.cap.get(cv2.CAP_PROP_FPS)
-    delay = int(1000 / fps)
+    alert_times = {}
+    last_sent_status = '0'  # Initialize last_sent_status as '0'
+    
+    try:
+        while camera.running:
+            frame = camera.get_frame()
+            if frame is None:
+                continue
 
-    while camera.running:
-        start_time = time.time()
-        frame = camera.get_frame()
-        if frame is None:
-            continue
-        
-        # Calculate the custom areas for the current frame
-        custom_area1, custom_area2 = calculate_custom_areas(frame)
-        
-        results = detector.predict(frame)
-        labeled_img = detector.draw_box(frame, results[0])
-        
-        # Draw the custom areas on the image
-        display_img = draw_custom_area_CPB(labeled_img, custom_area1)
-        display_img = draw_custom_area_SULP(display_img, custom_area2)
-        
-        # Resize the image for display
-        display_img = cv2.resize(display_img, (1280,640))
-        
-        # Check for objects in the custom areas and trigger alerts
-        xyxy = results[0].boxes.xyxy.numpy()
-        class_id = results[0].boxes.cls.numpy().astype(int)
-        class_name = [detector.class_list[x] for x in class_id]
-        
-        alert_triggered = False
-        
-        for box, name in zip(xyxy, class_name):
-            current_time = time.time()
-            
-            if name == 'SULPHURIC':
-                if is_in_custom_area(box, custom_area1):
-                    if 'SULPHURIC' not in alert_times:
-                        alert_times['SULPHURIC'] = current_time
-                    if current_time - alert_times['SULPHURIC'] > 2:
-                        save_image(display_img, "alert_image_SULPHURIC.jpg")
-                        alert_times.pop('SULPHURIC')
-                        
-                    # Add bold text overlay for misposition at the top right
-                    text = "Misposition - Red Lamp"
-                    font = cv2.FONT_HERSHEY_SIMPLEX
-                    font_scale = 1
-                    font_thickness = 2
-                    text_size = cv2.getTextSize(text, font, font_scale, font_thickness)[0]
-                    text_x = display_img.shape[1] - text_size[0] - 50
-                    text_y = 50
+            CPB_AREA, SULP_AREA = calculate_custom_areas(frame)
+            results = detector.predict(frame)
+            labeled_img = detector.draw_box(frame, results[0])
 
-                    # Draw the text multiple times to create a bold effect
-                    cv2.putText(display_img, text, (text_x, text_y), font, font_scale, (0, 0, 255), font_thickness + 1, cv2.LINE_AA)
-                    cv2.putText(display_img, text, (text_x, text_y), font, font_scale, (0, 0, 255), font_thickness + 2, cv2.LINE_AA)
-                    
-                    alert_message(f"Alert! SULPHURIC detected in custom area: {box}")
-                    try:
-                        # ser.write(b'1')
-                        print("Signal sent to ESP32 successfully.")
-                    except serial.SerialException as e:
-                        print(f"Error sending signal to ESP32: {e}")
-                    alert_triggered = True
-            
-            elif name == 'CPB-75D':
-                if is_in_custom_area(box, custom_area2):
-                    if 'CPB-75D' not in alert_times:
-                        alert_times['CPB-75D'] = current_time
-                    if current_time - alert_times['CPB-75D'] > 2:
-                        save_image(display_img, "alert_image_CPB-75D.jpg")
-                        alert_times.pop('CPB-75D')
-                        
-                    # Add bold text overlay for misposition at the top right
-                    text = "Misposition - Red Lamp"
-                    font = cv2.FONT_HERSHEY_SIMPLEX
-                    font_scale = 1
-                    font_thickness = 2
-                    text_size = cv2.getTextSize(text, font, font_scale, font_thickness)[0]
-                    text_x = display_img.shape[1] - text_size[0] - 50
-                    text_y = 100
+            display_img = draw_custom_area_CPB(labeled_img, CPB_AREA)
+            display_img = draw_custom_area_SULP(display_img, SULP_AREA)
+            display_img = cv2.resize(display_img, (1280, 640))
 
-                    # Draw the text multiple times to create a bold effect
-                    cv2.putText(display_img, text, (text_x, text_y), font, font_scale, (0, 0, 255), font_thickness + 1, cv2.LINE_AA)
-                    cv2.putText(display_img, text, (text_x, text_y), font, font_scale, (0, 0, 255), font_thickness + 2, cv2.LINE_AA)
-                    
-                    alert_message(f"Alert! CPB-75D detected in custom area: {box}")
-                    try:
-                        # ser.write(b'1')
-                        print("Signal sent to ESP32 successfully.")
-                    except serial.SerialException as e:
-                        print(f"Error sending signal to ESP32: {e}")
-                    alert_triggered = True
+            xyxy = results[0].boxes.xyxy.numpy()
+            class_id = results[0].boxes.cls.numpy().astype(int)
+            class_name = [detector.class_list[x] for x in class_id]
 
-        # Reset alert times if no alert is triggered
-        if not alert_triggered:
-            alert_times.clear()
-            try:
-                # Add bold text for green lamp condition at the top right
-                text = "Good position - Green Lamp"
-                font = cv2.FONT_HERSHEY_SIMPLEX
-                font_scale = 1
-                font_thickness = 2
-                text_size = cv2.getTextSize(text, font, font_scale, font_thickness)[0]
-                text_x = display_img.shape[1] - text_size[0] - 50
-                text_y = 100
+            status = "GOOD"
+            for box, name in zip(xyxy, class_name):
+                current_time = time.time()
 
-                # Draw the text multiple times to create a bold effect
-                cv2.putText(display_img, text, (text_x, text_y), font, font_scale, (0, 255, 0), font_thickness + 1, cv2.LINE_AA)
-                cv2.putText(display_img, text, (text_x, text_y), font, font_scale, (0, 255, 0), font_thickness + 2, cv2.LINE_AA)
-                
-            except serial.SerialException as e:
-                print(f"Error sending signal to ESP32: {e}")
+                if is_in_custom_area(box, CPB_AREA) and (name == 'SULPHURIC' or name == 'NaOH'):
+                    if calculate_intersection_area(box, CPB_AREA) > 30:
+                        status = "ALARM"
+                        if 'SULPHURIC' not in alert_times:
+                            alert_times['SULPHURIC'] = current_time
+                        if current_time - alert_times['SULPHURIC'] > 2:
+                            save_image(display_img, f"Alarm_CPB-75D_Area.jpg")
+                            alert_times.pop('SULPHURIC')
+                            if last_sent_status != "1":
+                                logging.info("1 Alarm !! SULPHURIC in area CPB-75D")
+                                last_sent_status = "1"
+                                try:
+                                    client.write_coil(16, True)  # Send signal 1
+                                    print("Signal 1 sent (alarm)")
+                                    threading.Thread(target=read_coil_status, args=(last_sent_status,)).start()
+                                except:
+                                    print('Write 1 fail')
+                                
+                elif is_in_custom_area(box, SULP_AREA) and (name == 'CPB-75D' or name == 'NaOH'):
+                    if calculate_intersection_area(box, SULP_AREA) > 30:
+                        status = "ALARM"
+                        if 'CPB-75D' not in alert_times:
+                            alert_times['CPB-75D'] = current_time
+                        if current_time - alert_times['CPB-75D'] > 2:
+                            save_image(display_img, f"Alarm_SULPHURIC_Area.jpg")
+                            alert_times.pop('CPB-75D')
+                            if last_sent_status != "1":
+                                logging.info("1 Alarm !! CPB-75D in area SULPHURIC")
+                                last_sent_status = "1"
+                                try:
+                                    client.write_coil(16, True)  # Send signal 1
+                                    print("Signal 1 sent (alarm)")
+                                    threading.Thread(target=read_coil_status, args=(last_sent_status,)).start()
+                                except:
+                                    print('Write 1 fail')
 
-        
-        # Calculate elapsed time and delay to match the frame rate
-        elapsed_time = time.time() - start_time
-        if elapsed_time < delay / 1000:
-            time.sleep((delay / 1000) - elapsed_time)
+            if status == "GOOD":
+                alert_times.clear()
+                if last_sent_status != "0":
+                    logging.info("0 Normal")
+                    last_sent_status = "0"
+                    threading.Thread(target=read_coil_status, args=(last_sent_status,)).start()
 
-        # Exit the video display if 'q' is pressed
-        if cv2.waitKey(1) & 0xFF == ord('q'):
-            camera.running = False
-            break
-        # Display the frame in a window
-        cv2.imshow('Video', display_img)
-# Start the capture thread
-capture_thread = threading.Thread(target=camera.capture_frames)
-capture_thread.start()
+            display_img, alert_triggered = alert_message(display_img, status)
 
-# Start the processing thread
-process_thread = threading.Thread(target=process_frames)
-process_thread.start()
+            cv2.imshow('Detections', display_img)
 
-# Wait for threads to complete
-capture_thread.join()
-process_thread.join()
+            if cv2.waitKey(1) & 0xFF == ord('q'):
+                if camera:
+                    camera.release()
+                logging.info("Program ended")
+                break
+    except Exception as e:
+        print(e)
+        pass
 
-# Release resources
-camera.release()
-# ser.close()
+
+if __name__ == "__main__":
+    try:
+        # Establish Modbus TCP connection
+        client = ModbusTcpClient('192.168.110.102')  # Replace with your device IP
+        connection = client.connect()
+        if not connection:
+            logging.error("Failed to connect to Modbus server.")
+            raise Exception("Connection error: Could not connect to Modbus server.")
+
+        # Initialize camera and detector
+        video_path =  r"rtsp://admin:PTE3402C@192.168.110.101:554" # Replace with the path to your video
+        model_path = "/home/smartfactory/projects/safety_projects/SAFETY_MAITREE_1.1_multi/model/model_v3_1_1/weights/model_v3_1_1.pt"  # Replace with the path to your YOLOv8 model
+
+        logging.info(f"Program started SW: MAITREE 1.0 Model: {os.path.basename(model_path)} MC: M-05-01 RMCH")
+
+        camera = CameraCapture(video_path)
+        detector = ObjectDetector(model_path)
+
+        # Start capturing frames in a separate thread
+        capture_thread = threading.Thread(target=camera.capture_frames)
+        capture_thread.start()
+
+        # Start processing frames
+        process_frames()
+
+    except Exception as e:
+        logging.error(f"An error occurred: {e}")
+        print(f"An error occurred: {e}")
+    
+    finally:
+        # Close Modbus client connection
+        if client:
+            client.close()
+        logging.info("Modbus connection closed.")
+
+        # Release camera resources if the camera is still running
+        if camera:
+            camera.release()
+
+        logging.info("Program terminated.")
 
